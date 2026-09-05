@@ -1,0 +1,702 @@
+name: Build Flutter APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      zip_url:
+        description: "URL ZIP project Flutter"
+        required: true
+        type: string
+
+      tag:
+        description: "Release tag"
+        required: true
+        type: string
+
+      build_type:
+        description: "Build type"
+        required: false
+        default: "release"
+        type: choice
+        options:
+          - release
+          - debug
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: flutter-build-${{ github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    env:
+      BUILD_TOKEN: ${{ secrets.BUILD_TOKEN }}
+
+    steps:
+
+      # =========================================================
+      # CHECKOUT
+      # =========================================================
+
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+
+      # =========================================================
+      # SYSTEM INFO
+      # =========================================================
+
+      - name: System Information
+        shell: bash
+        run: |
+          echo "=========================================="
+          echo "SYSTEM INFORMATION"
+          echo "=========================================="
+
+          echo "OS:"
+          cat /etc/os-release | head -5
+
+          echo
+          echo "CPU:"
+          nproc
+
+          echo
+          echo "Memory:"
+          free -h
+
+          echo
+          echo "Disk:"
+          df -h /
+
+          echo
+          echo "=========================================="
+
+
+      # =========================================================
+      # JAVA 17
+      # =========================================================
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Verify Java
+        shell: bash
+        run: |
+          set -e
+
+          echo "Java version:"
+          java -version
+
+          echo
+          echo "JAVA_HOME:"
+          echo "$JAVA_HOME"
+
+          test -n "$JAVA_HOME"
+
+          echo
+          echo "Java 17 OK."
+
+
+      # =========================================================
+      # FLUTTER
+      # =========================================================
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: false
+
+      - name: Verify Flutter
+        shell: bash
+        run: |
+          set -e
+
+          flutter --version
+
+          echo
+          flutter doctor -v || true
+
+
+      # =========================================================
+      # PREPARE WORKSPACE
+      # =========================================================
+
+      - name: Prepare Workspace
+        shell: bash
+        run: |
+          set -e
+
+          rm -rf "$GITHUB_WORKSPACE/input"
+          mkdir -p "$GITHUB_WORKSPACE/input"
+
+          echo "Workspace ready."
+
+
+      # =========================================================
+      # DOWNLOAD ZIP
+      # =========================================================
+
+      - name: Download Flutter Project
+        shell: bash
+        env:
+          ZIP_URL: ${{ inputs.zip_url }}
+        run: |
+          set -e
+
+          if [ -z "$ZIP_URL" ]; then
+            echo "::error::ZIP URL kosong."
+            exit 1
+          fi
+
+          if [ -z "$BUILD_TOKEN" ]; then
+            echo "::error::BUILD_TOKEN belum dibuat di GitHub Secrets."
+            exit 1
+          fi
+
+          echo "Downloading project..."
+
+          curl \
+            --fail \
+            --location \
+            --retry 5 \
+            --retry-delay 3 \
+            --connect-timeout 30 \
+            --max-time 600 \
+            -H "Authorization: Bearer $BUILD_TOKEN" \
+            -H "Accept: application/octet-stream" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            -H "User-Agent: FlutterBuildBot" \
+            "$ZIP_URL" \
+            --output "$GITHUB_WORKSPACE/input/project.zip"
+
+          echo
+          echo "Downloaded file:"
+          ls -lh "$GITHUB_WORKSPACE/input/project.zip"
+
+          FILE_SIZE=$(stat -c%s "$GITHUB_WORKSPACE/input/project.zip")
+
+          if [ "$FILE_SIZE" -lt 1000 ]; then
+            echo "::error::ZIP terlalu kecil / kemungkinan download gagal."
+            exit 1
+          fi
+
+          echo "ZIP size: $FILE_SIZE bytes"
+
+
+      # =========================================================
+      # VALIDATE ZIP
+      # =========================================================
+
+      - name: Validate ZIP
+        shell: bash
+        run: |
+          set -e
+
+          ZIP="$GITHUB_WORKSPACE/input/project.zip"
+
+          echo "Testing ZIP..."
+
+          unzip -t "$ZIP"
+
+          echo
+          echo "ZIP valid."
+
+
+      # =========================================================
+      # EXTRACT PROJECT
+      # =========================================================
+
+      - name: Extract Project
+        shell: bash
+        run: |
+          set -e
+
+          rm -rf "$GITHUB_WORKSPACE/project"
+          mkdir -p "$GITHUB_WORKSPACE/project"
+
+          unzip -q \
+            "$GITHUB_WORKSPACE/input/project.zip" \
+            -d "$GITHUB_WORKSPACE/project"
+
+          echo "Initial structure:"
+          find "$GITHUB_WORKSPACE/project" \
+            -maxdepth 2 \
+            -type f | head -100
+
+
+      # =========================================================
+      # FIND FLUTTER ROOT
+      # =========================================================
+
+      - name: Detect Flutter Project
+        shell: bash
+        run: |
+          set -e
+
+          PROJECT="$GITHUB_WORKSPACE/project"
+
+          PUBSPEC=$(find "$PROJECT" \
+            -name pubspec.yaml \
+            -type f \
+            -print -quit)
+
+          if [ -z "$PUBSPEC" ]; then
+            echo "::error::pubspec.yaml tidak ditemukan."
+            echo
+            echo "Isi project:"
+            find "$PROJECT" -maxdepth 4 -type f | head -200
+            exit 1
+          fi
+
+          FLUTTER_ROOT=$(dirname "$PUBSPEC")
+
+          echo "Flutter project ditemukan:"
+          echo "$FLUTTER_ROOT"
+
+          echo "FLUTTER_ROOT=$FLUTTER_ROOT" >> "$GITHUB_ENV"
+
+
+      # =========================================================
+      # PROJECT INFORMATION
+      # =========================================================
+
+      - name: Inspect Flutter Project
+        shell: bash
+        run: |
+          set -e
+
+          cd "$FLUTTER_ROOT"
+
+          echo "=========================================="
+          echo "FLUTTER PROJECT"
+          echo "=========================================="
+
+          echo
+          echo "Path:"
+          pwd
+
+          echo
+          echo "Files:"
+          find . -maxdepth 2 -type f | sort | head -150
+
+          echo
+          echo "=========================================="
+
+
+      # =========================================================
+      # PREPARE ANDROID
+      # =========================================================
+
+      - name: Prepare Android
+        shell: bash
+        run: |
+          set -e
+
+          cd "$FLUTTER_ROOT"
+
+          echo "Checking Android project..."
+
+          if [ ! -d "android" ] || [ ! -f "android/gradlew" ]; then
+
+            echo "Android project tidak lengkap."
+            echo "Generating Android platform..."
+
+            flutter create \
+              --platforms=android \
+              --project-name=build_apk_temp \
+              .
+
+          else
+
+            echo "Android project sudah tersedia."
+
+          fi
+
+          chmod +x android/gradlew || true
+
+          echo
+          echo "Android structure:"
+          find android -maxdepth 3 -type f | sort | head -150
+
+
+      # =========================================================
+      # FIX AGP 9 / FLUTTER GRADLE COMPATIBILITY
+      # =========================================================
+
+      - name: Configure Gradle Compatibility
+        shell: bash
+        run: |
+          set -e
+
+          cd "$FLUTTER_ROOT"
+
+          mkdir -p android
+
+          touch android/gradle.properties
+
+          echo "Configuring Gradle..."
+
+          # Remove old values if present
+          sed -i '/^android\.newDsl=/d' android/gradle.properties
+          sed -i '/^android\.builtInKotlin=/d' android/gradle.properties
+          sed -i '/^org\.gradle\.jvmargs=/d' android/gradle.properties
+          sed -i '/^org\.gradle\.daemon=/d' android/gradle.properties
+          sed -i '/^org\.gradle\.parallel=/d' android/gradle.properties
+          sed -i '/^org\.gradle\.caching=/d' android/gradle.properties
+
+          cat >> android/gradle.properties <<'EOF'
+
+          # Flutter / AGP 9 compatibility
+          android.newDsl=false
+          android.builtInKotlin=false
+
+          # Gradle performance
+          org.gradle.jvmargs=-Xmx4g -Dfile.encoding=UTF-8
+          org.gradle.daemon=true
+          org.gradle.parallel=true
+          org.gradle.caching=true
+          EOF
+
+          echo
+          echo "android/gradle.properties:"
+          cat android/gradle.properties
+
+
+      # =========================================================
+      # GRADLE PERMISSION
+      # =========================================================
+
+      - name: Fix Gradle Permissions
+        shell: bash
+        run: |
+          set -e
+
+          cd "$FLUTTER_ROOT"
+
+          if [ -f android/gradlew ]; then
+            chmod +x android/gradlew
+          fi
+
+          echo "Gradle permissions OK."
+
+
+      # =========================================================
+      # FLUTTER CLEAN
+      # =========================================================
+
+      - name: Flutter Clean
+        shell: bash
+        run: |
+          set -e
+
+          cd "$FLUTTER_ROOT"
+
+          flutter clean
+
+
+      # =========================================================
+      # PUB GET
+      # =========================================================
+
+      - name: Flutter Pub Get
+        shell: bash
+        run: |
+          set -e
+
+          cd "$FLUTTER_ROOT"
+
+          flutter pub get
+
+
+      # =========================================================
+      # ANALYZE
+      # =========================================================
+
+      - name: Flutter Analyze
+        continue-on-error: true
+        shell: bash
+        run: |
+          cd "$FLUTTER_ROOT"
+
+          echo "[RESULT_ANALYZE]"
+
+          flutter analyze \
+            --no-fatal-infos \
+            --no-fatal-warnings || true
+
+          echo "[END_RESULT_ANALYZE]"
+
+
+      # =========================================================
+      # GRADLE VERSION / ENVIRONMENT
+      # =========================================================
+
+      - name: Validate Gradle
+        shell: bash
+        run: |
+          set -e
+
+          cd "$FLUTTER_ROOT"
+
+          chmod +x android/gradlew
+
+          echo "Gradle version:"
+          cd android
+          ./gradlew --version
+
+
+      # =========================================================
+      # DETECT BUILD TYPE
+      # =========================================================
+
+      - name: Detect Build Type
+        shell: bash
+        run: |
+          BUILD_TYPE="${{ inputs.build_type }}"
+
+          if [ "$BUILD_TYPE" != "debug" ] && [ "$BUILD_TYPE" != "release" ]; then
+            BUILD_TYPE="release"
+          fi
+
+          echo "BUILD_TYPE=$BUILD_TYPE" >> "$GITHUB_ENV"
+
+          echo "Build type: $BUILD_TYPE"
+
+
+      # =========================================================
+      # BUILD APK - FIRST ATTEMPT
+      # =========================================================
+
+      - name: Build APK
+        id: build_apk
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -o pipefail
+
+          cd "$FLUTTER_ROOT"
+
+          echo "=========================================="
+          echo "BUILD APK"
+          echo "=========================================="
+
+          if [ "$BUILD_TYPE" = "debug" ]; then
+
+            flutter build apk \
+              --debug \
+              --verbose 2>&1 | tee "$GITHUB_WORKSPACE/build.log"
+
+          else
+
+            flutter build apk \
+              --release \
+              --verbose 2>&1 | tee "$GITHUB_WORKSPACE/build.log"
+
+          fi
+
+
+      # =========================================================
+      # RETRY BUILD
+      # =========================================================
+
+      - name: Retry APK Build
+        id: retry_build
+        if: steps.build_apk.outcome == 'failure'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -o pipefail
+
+          cd "$FLUTTER_ROOT"
+
+          echo "=========================================="
+          echo "BUILD PERTAMA GAGAL"
+          echo "MELAKUKAN RETRY..."
+          echo "=========================================="
+
+          flutter clean
+
+          flutter pub get
+
+          if [ "$BUILD_TYPE" = "debug" ]; then
+
+            flutter build apk \
+              --debug \
+              --verbose 2>&1 | tee "$GITHUB_WORKSPACE/retry-build.log"
+
+          else
+
+            flutter build apk \
+              --release \
+              --verbose 2>&1 | tee "$GITHUB_WORKSPACE/retry-build.log"
+
+          fi
+
+
+      # =========================================================
+      # FIND APK
+      # =========================================================
+
+      - name: Check Build Result
+        id: check_apk
+        shell: bash
+        run: |
+          set -e
+
+          cd "$FLUTTER_ROOT"
+
+          echo "Searching APK..."
+
+          APK=""
+
+          if [ -d "build/app/outputs/apk" ]; then
+            APK=$(find \
+              build/app/outputs/apk \
+              -type f \
+              -name "*.apk" \
+              -print \
+              | head -1)
+          fi
+
+          if [ -z "$APK" ]; then
+            APK=$(find \
+              build \
+              -type f \
+              -name "*.apk" \
+              -print \
+              | head -1 || true)
+          fi
+
+          if [ -z "$APK" ]; then
+
+            echo "::error::APK tidak ditemukan."
+
+            echo
+            echo "Build directory:"
+            find build \
+              -maxdepth 6 \
+              -type f 2>/dev/null \
+              | sort \
+              | head -300 || true
+
+            echo
+            echo "=========================================="
+            echo "BUILD LOG"
+            echo "=========================================="
+
+            if [ -f "$GITHUB_WORKSPACE/retry-build.log" ]; then
+              tail -n 150 "$GITHUB_WORKSPACE/retry-build.log"
+            elif [ -f "$GITHUB_WORKSPACE/build.log" ]; then
+              tail -n 150 "$GITHUB_WORKSPACE/build.log"
+            fi
+
+            exit 1
+          fi
+
+          echo "APK ditemukan:"
+          echo "$APK"
+
+          mkdir -p "$GITHUB_WORKSPACE/output"
+
+          cp "$APK" "$GITHUB_WORKSPACE/output/app.apk"
+
+          echo
+          echo "APK size:"
+          ls -lh "$GITHUB_WORKSPACE/output/app.apk"
+
+          echo "APK_PATH=$GITHUB_WORKSPACE/output/app.apk" >> "$GITHUB_ENV"
+
+
+      # =========================================================
+      # VERIFY APK
+      # =========================================================
+
+      - name: Verify APK
+        shell: bash
+        run: |
+          set -e
+
+          APK="$GITHUB_WORKSPACE/output/app.apk"
+
+          test -f "$APK"
+
+          SIZE=$(stat -c%s "$APK")
+
+          echo "APK size: $SIZE bytes"
+
+          if [ "$SIZE" -lt 10000 ]; then
+            echo "::error::APK terlalu kecil / corrupt."
+            exit 1
+          fi
+
+          file "$APK"
+
+          echo
+          echo "APK verification OK."
+
+
+      # =========================================================
+      # UPLOAD ARTIFACT
+      # =========================================================
+
+      - name: Upload APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: flutter-apk
+          path: output/app.apk
+          if-no-files-found: error
+          retention-days: 7
+
+
+      # =========================================================
+      # UPLOAD BUILD LOG
+      # =========================================================
+
+      - name: Upload Build Logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: flutter-build-logs
+          path: |
+            build.log
+            retry-build.log
+          if-no-files-found: ignore
+          retention-days: 3
+
+
+      # =========================================================
+      # FINAL RESULT
+      # =========================================================
+
+      - name: Final Result
+        if: always()
+        shell: bash
+        run: |
+          if [ -f "$GITHUB_WORKSPACE/output/app.apk" ]; then
+
+            echo "=========================================="
+            echo "BUILD SUCCESS"
+            echo "=========================================="
+
+            ls -lh "$GITHUB_WORKSPACE/output/app.apk"
+
+          else
+
+            echo "=========================================="
+            echo "BUILD FAILED"
+            echo "=========================================="
+
+            exit 1
+
+          fi
